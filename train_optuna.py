@@ -13,23 +13,25 @@ from sklearn.metrics import r2_score
 
 from src.preprocessing import Preprocessor
 from src.dataset import Dataset
-from src.models import lstm_history
+from src.models import cnnlstm
 
 parser = argparse.ArgumentParser()
 
 parser.add_argument("--seed", default=42, type=int, help="random seed for reproducibility")
-parser.add_argument("--batch_size", default=128, type=int, help="size of batch")
+parser.add_argument("--batch_size", default=64, type=int, help="size of batch")
 parser.add_argument("--eta_min", default=1e-6, type=float, help="Minimum learning rate for Cosine Annealing scheduler")
 parser.add_argument('--print_freq', type=int, default=1, help='Frequency of printing training progress')
 parser.add_argument("--exp_name", default="atten", type=str)
 parser.add_argument("--nominal_output", default=1293, type=int, help="Nominal output power of fve.")
-parser.add_argument("--target_col", default="energy", type=str, help="predicted variable")
+parser.add_argument("--target_col", default="PV_energy", type=str, help="predicted variable")
 parser.add_argument("--test_ratio", default=0.15, type=float, help="relative size of test set")
 parser.add_argument("--strategy", default="simple", type=str, choices=["simple", "expanding", "rolling"], help="strategy: 'simple', 'expanding', or 'rolling'")
 parser.add_argument("--initial_train_size", default=10000, type=int, help="initial rows (hours) for training window")
 parser.add_argument("--step_size", default=5000, type=int, help="step size for expanding/rolling strategy")
 
-parser.add_argument("--horizon", default=24, type=int, help="")
+parser.add_argument("--lookback", default=24, type=int, help="number of past rows (hours) to look back for historical weather and energy data")
+parser.add_argument("--horizon", default=24, type=int, help="number of future rows (hours) to look ahead for weather forecast and target predictions")
+
 parser.add_argument("--dataset_path", default="data/pv_dwd_icon_eu_previous_day.csv", type=str, help="")
 
 parser.add_argument("--lookback_cols", nargs="+", 
@@ -40,7 +42,10 @@ parser.add_argument("--lookback_cols", nargs="+",
     help="List of features for history (lookback)"
 )
 parser.add_argument("--horizon_cols", nargs="+", 
-    default=[], 
+    default=[
+        'Forecast_temperature', 'Forecast_humidity', 'Forecast cloud_cover', 'Forecast_GHI',
+        'Forecast_DHI', 'sin_hour', 'cos_hour', 'sin_day_of_year', 'cos_day_of_year', 'wind_u', 'wind_v'
+    ], 
     help="List of features for future horizon"
 )
 
@@ -220,10 +225,10 @@ def run_validation(args, train_df: pd.DataFrame, dev_df: pd.DataFrame, writer, d
         shuffle=False,
     )
 
-    args.input_size = len(args.lookback_cols)
+    args.input_size = len(args.lookback_cols) + len(args.horizon_cols)
     args.output_size = args.horizon
 
-    model = lstm_history.Model(args=args).to(device)
+    model = cnnlstm.Model(args=args).to(device)
 
     criterion = torch.nn.L1Loss()
 
@@ -418,7 +423,9 @@ def objective(trial: optuna.Trial, base_args: argparse.Namespace, train_df: pd.D
     args.hidden_size = trial.suggest_categorical("hidden_size", [16, 32, 64, 128, 256])
     args.dropout = trial.suggest_float("dropout", 0.0, 0.5)
     args.is_bidirectional = trial.suggest_categorical("is_bidirectional", [True, False])
-    args.lookback = trial.suggest_categorical("lookback", [24, 48, 72])
+
+    args.cnn_channels = trial.suggest_categorical("cnn_channels", [8, 16, 32, 64, 128])
+    args.cnn_kernel_size = trial.suggest_categorical("cnn_kernel_size", [3, 5, 7])
 
     result = run_validation(args=args, train_df=train_df, dev_df=dev_df, writer=None, device=device)
 
@@ -440,7 +447,7 @@ def main(args: argparse.Namespace) -> None:
     train_df, dev_df, test_df = load_dataset(args.test_ratio, args.dataset_path)
     
     study = optuna.create_study(
-        study_name="lstm_history",    
+        study_name="cnnlstm_future_model",    
         storage="sqlite:///optuna_study.db", 
         load_if_exists=True,              
         direction="minimize"
