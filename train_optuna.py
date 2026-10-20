@@ -11,10 +11,9 @@ import json
 import optuna
 from sklearn.metrics import r2_score
 
-from src.data_splitting import Splitter
 from src.preprocessing import Preprocessor
 from src.dataset import Dataset
-from src.models import model_attention
+from src.models import lstm_history
 
 parser = argparse.ArgumentParser()
 
@@ -30,20 +29,18 @@ parser.add_argument("--strategy", default="simple", type=str, choices=["simple",
 parser.add_argument("--initial_train_size", default=10000, type=int, help="initial rows (hours) for training window")
 parser.add_argument("--step_size", default=5000, type=int, help="step size for expanding/rolling strategy")
 
+parser.add_argument("--horizon", default=24, type=int, help="")
+parser.add_argument("--dataset_path", default="data/pv_dwd_icon_eu_previous_day.csv", type=str, help="")
+
 parser.add_argument("--lookback_cols", nargs="+", 
     default=[
-        "cloud_cover.total", "pressure", "irradiance", "ozone", "humidity", 
-        "openmeteo_pm10", "tmp_module", "wind_u", "wind_v", "solar_elevation", 
-        "sin_hour", "cos_hour", "sin_day_of_year", "cos_day_of_year", "energy",
+        'Forecast_temperature', 'Forecast_humidity', 'Forecast cloud_cover', 'Forecast_GHI',
+        'Forecast_DHI', 'PV_energy', 'sin_hour', 'cos_hour', 'sin_day_of_year', 'cos_day_of_year', 'wind_u', 'wind_v'
     ], 
     help="List of features for history (lookback)"
 )
 parser.add_argument("--horizon_cols", nargs="+", 
-    default=[
-        "cloud_cover.total", "pressure", "irradiance", "ozone", "humidity", 
-        "openmeteo_pm10", "temperature", "wind_u", "wind_v", "solar_elevation", 
-        "sin_hour", "cos_hour", "sin_day_of_year", "cos_day_of_year",
-    ], 
+    default=[], 
     help="List of features for future horizon"
 )
 
@@ -59,44 +56,85 @@ def set_seed(seed: int = 42) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-def load_dataset(test_ratio: float) -> tuple[pd.DataFrame, pd.DataFrame]:
-    dataset = pd.read_csv("data/fve_aba_dataset.csv", index_col="timestamp", parse_dates=True)
-    dataset = dataset.sort_index().asfreq('1h')
-    
-    test_split_idx = int(len(dataset) * (1 - test_ratio))
-    dev_df = dataset.iloc[:test_split_idx].copy()
-    test_df = dataset.iloc[test_split_idx:].copy()
-    return dev_df, test_df
+def load_dataset(test_ratio: float, dataset_path: str,) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    dataset = pd.read_csv(dataset_path)
+    dataset["timestamp"] = pd.to_datetime(dataset["timestamp"], utc=True)
+    dataset = dataset.set_index("timestamp").sort_index()
 
-def calculate_metrics(scaled_loss: float, all_preds: np.ndarray, all_targets: np.ndarray, target_mean: float, target_std: float, nominal_output: float, scaled_zero: float) -> dict:
-    """Spočítá detailní metriky na reálné (ne-normalizované) škále."""
-    real_preds = all_preds * target_std + target_mean
-    real_targets = all_targets * target_std + target_mean
-    
-    real_mae = np.mean(np.abs(real_preds - real_targets))
-    
-    mask = real_targets > 0.1 
-    if np.sum(mask) > 0:
-        real_active_mae = np.mean(np.abs(real_preds[mask] - real_targets[mask]))
-        active_mae_pct = (real_active_mae / nominal_output) * 100
+    if dataset.index.has_duplicates:
+        raise ValueError("Dataset contains duplicate timestamps.")
+
+    dataset = dataset.asfreq("h")
+
+    train_end = pd.Timestamp("2025-05-01 00:00:00", tz="UTC")
+    val_end = pd.Timestamp("2025-10-01 00:00:00", tz="UTC")
+
+    train = dataset.loc[dataset.index < train_end].copy()
+    val = dataset.loc[(dataset.index >= train_end) &(dataset.index < val_end)].copy()
+    test = dataset.loc[dataset.index >= val_end].copy()
+
+    return train, val, test
+
+def calculate_metrics(all_preds: np.ndarray, all_targets: np.ndarray, preprocessor: Preprocessor, nominal_output: float) -> dict[str, float]:
+    if nominal_output <= 0:
+        raise ValueError("nominal_output has to be higher than 0.")
+
+    real_preds = preprocessor.inverse_transform_target(all_preds)
+    real_targets = preprocessor.inverse_transform_target(all_targets)
+
+    preds = real_preds.reshape(-1)
+    targets = real_targets.reshape(-1)
+
+    errors = preds - targets
+    abs_errors = np.abs(errors)
+
+    mae = np.mean(abs_errors)
+    rmse = np.sqrt(np.mean(errors ** 2))
+    r2 = r2_score(targets, preds)
+    mbe = np.mean(errors)
+
+    nmae = (mae / nominal_output) * 100
+    nrmse = (rmse / nominal_output) * 100
+
+    mask = targets > 0.1
+
+    if np.any(mask):
+        active_errors = errors[mask]
+
+        active_mae = np.mean(np.abs(active_errors))
+        active_rmse = np.sqrt(np.mean(active_errors ** 2))
+
+        active_nmae = 100 * active_mae / nominal_output
+        active_nrmse = 100 * active_rmse / nominal_output
+
+        active_r2 = r2_score(targets[mask], preds[mask])
+        active_mbe = np.mean(active_errors)
     else:
-        real_active_mae = 0.0
-        active_mae_pct = 0.0
-        
-    r2 = r2_score(real_targets, real_preds)
-    mbe = np.mean(real_preds - real_targets)
-    
+        active_mae = np.nan
+        active_rmse = np.nan
+        active_nmae = np.nan
+        active_nrmse = np.nan
+        active_r2 = np.nan
+        active_mbe = np.nan
+
     return {
-        "real_mae": real_mae,
-        "real_active_mae": real_active_mae,
-        "mae_pct": (real_mae / nominal_output) * 100,
-        "active_mae_pct": active_mae_pct,
-        "r2": r2,
-        "mbe": mbe
+        "mae": float(mae),
+        "rmse": float(rmse),
+        "nmae": float(nmae),
+        "nrmse": float(nrmse),
+        "r2": float(r2),
+        "mbe": float(mbe),
+
+        "active_mae": float(active_mae),
+        "active_rmse": float(active_rmse),
+        "active_nmae": float(active_nmae),
+        "active_nrmse": float(active_nrmse),
+        "active_r2": float(active_r2),
+        "active_mbe": float(active_mbe),
     }
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, curr_epoch):
+def train_one_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0.0
     all_preds, all_targets = [], []
@@ -105,7 +143,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, curr_epoch)
         x_past, x_future, targets = [b.to(device) for b in batch]
         
         optimizer.zero_grad()
-        outputs = model(x_past, x_future, targets=targets, curr_epoch=curr_epoch).squeeze(-1)   
+        outputs = model(x_past, x_future).squeeze(-1)   
         loss = criterion(outputs, targets)
         loss.backward()
         optimizer.step()
@@ -136,200 +174,262 @@ def evaluate_model(model, dataloader, criterion, device):
     return total_loss / len(dataloader.dataset), np.concatenate(all_preds), np.concatenate(all_targets)
 
 
-def run_cross_validation(args, df_splits, writer, device):
-    criterion = torch.nn.L1Loss()
-    global_epoch = 0
-    best_val_loss = float('inf') 
-    best_model_state = None
-    last_preprocessor = None
-    
-    feature_cols = list(set(args.lookback_cols + args.horizon_cols))
-    patience = getattr(args, 'patience', 5) 
-    
-    fold_best_maes = []
-    fold_best_metrics = []
-    
-    for fold_idx, (train_df, val_df) in enumerate(df_splits):
-        model = model_attention.Model(args=args).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=args.epochs, eta_min=args.eta_min)
-        
-        last_preprocessor = Preprocessor(feature_cols=feature_cols, target_col=args.target_col, fold_idx=fold_idx)
-        train_scaled, val_scaled = last_preprocessor.process_fold(train_df=train_df, val_df=val_df)
-        
-        target_mean = last_preprocessor.target_scaler.mean_[0]
-        target_std = last_preprocessor.target_scaler.scale_[0]
-        scaled_zero = (0.0 - target_mean) / target_std
-        
-        train_loader = torch.utils.data.DataLoader(
-            Dataset(data=train_scaled, lookback=args.lookback, horizon=args.horizon, lookback_cols=args.lookback_cols, horizon_cols=args.horizon_cols, target_col=args.target_col),
-            batch_size=args.batch_size, shuffle=True
-        )
-        val_loader = torch.utils.data.DataLoader(
-            Dataset(data=val_scaled, lookback=args.lookback, horizon=args.horizon, lookback_cols=args.lookback_cols, horizon_cols=args.horizon_cols, target_col=args.target_col),
-            batch_size=args.batch_size, shuffle=False
-        )
-        
-        fold_best_val_mae = float('inf')
-        fold_best_m_dict = None
-        patience_counter = 0
-        
-        for epoch in range(args.epochs):
-            train_loss, t_preds, t_targets = train_one_epoch(model, train_loader, optimizer, criterion, device, curr_epoch=epoch)
-            val_loss, v_preds, v_targets = evaluate_model(model, val_loader, criterion, device)
-            
-            t_metrics = calculate_metrics(train_loss, t_preds, t_targets, target_mean, target_std, args.nominal_output, scaled_zero)
-            v_metrics = calculate_metrics(val_loss, v_preds, v_targets, target_mean, target_std, args.nominal_output, scaled_zero)
-            
-            if v_metrics["real_mae"] < best_val_loss:
-                best_val_loss = v_metrics["real_mae"]
-                best_model_state = copy.deepcopy(model.state_dict())
+def run_validation(args, train_df: pd.DataFrame, dev_df: pd.DataFrame, writer, device):
+    preprocessor = Preprocessor(lookback_cols=args.lookback_cols, horizon_cols=args.horizon_cols, target_col=args.target_col)
 
-            if v_metrics["real_mae"] < fold_best_val_mae:
-                fold_best_val_mae = v_metrics["real_mae"]
-                fold_best_m_dict = v_metrics
-                patience_counter = 0 
-            else:
-                patience_counter += 1 
+    train_scaled, val_scaled = preprocessor.fit_and_transform(train_df=train_df, val_df=dev_df)
 
-            if writer:
-                current_lr = scheduler.get_last_lr()[0]
-                writer.add_scalar(f'Fold_{fold_idx}/Learning_Rate', current_lr, epoch)
-                writer.add_scalars(f'Fold_{fold_idx}/Real_MAE', {'Train': t_metrics["real_mae"], 'Val': v_metrics["real_mae"]}, epoch)
-                writer.add_scalar(f'Fold_{fold_idx}/Val_R2', v_metrics["r2"], epoch)
+    if args.lookback > 0:
+        val_data = pd.concat([train_scaled.tail(args.lookback), val_scaled])
+    else:
+        val_data = val_scaled.copy()
 
-            scheduler.step()
-            
-            # --- ZDE PŘIDÁNO: Výpis do konzole ---
-            if (epoch + 1) % args.print_freq == 0 or epoch == 0:
-                print(f"  Fold {fold_idx + 1} | Ep {epoch + 1}/{args.epochs} -> "
-                      f"Val MAE: {v_metrics['real_mae']:.2f} ({v_metrics['mae_pct']:.2f}%) | "
-                      f"Active MAE: {v_metrics['real_active_mae']:.2f} ({v_metrics['active_mae_pct']:.2f}%) | "
-                      f"R²: {v_metrics['r2']:.4f} | MBE: {v_metrics['mbe']:.2f}")
-            
-            global_epoch += 1
-            if patience_counter >= patience:
-                print(f"  [Early Stopping] Fold {fold_idx + 1} ukončen předčasně v epoše {epoch + 1}.")
-                break
-                
-        fold_best_maes.append(fold_best_val_mae)
-        fold_best_metrics.append(fold_best_m_dict)
-
-    avg_val_mae = np.mean(fold_best_maes)
-    avg_val_r2 = np.mean([m["r2"] for m in fold_best_metrics])
-    avg_val_mbe = np.mean([m["mbe"] for m in fold_best_metrics])
-    
-    avg_val_active_mae = np.mean([m["real_active_mae"] for m in fold_best_metrics])
-    avg_val_active_mae_pct = np.mean([m["active_mae_pct"] for m in fold_best_metrics])
-    
-    return best_model_state, last_preprocessor, global_epoch, avg_val_mae, avg_val_r2, avg_val_mbe, avg_val_active_mae, avg_val_active_mae_pct
-
-
-def evaluate_test_set(args, model, test_df, preprocessor, device):
-    test_scaled = test_df.copy()
-    if preprocessor.cols_to_scale:
-        test_scaled[preprocessor.cols_to_scale] = preprocessor.feature_scaler.transform(test_df[preprocessor.cols_to_scale])
-    test_scaled[[args.target_col]] = preprocessor.target_scaler.transform(test_df[[args.target_col]])
-
-    test_loader = torch.utils.data.DataLoader(
-        Dataset(data=test_scaled, lookback=args.lookback, horizon=args.horizon, lookback_cols=args.lookback_cols, horizon_cols=args.horizon_cols, target_col=args.target_col),
-        batch_size=args.batch_size, shuffle=False
+    train_dataset = Dataset(
+        data=train_scaled,
+        lookback=args.lookback,
+        horizon=args.horizon,
+        lookback_cols=args.lookback_cols,
+        horizon_cols=args.horizon_cols,
+        target_col=args.target_col,
     )
 
-    target_mean = preprocessor.target_scaler.mean_[0]
-    target_std = preprocessor.target_scaler.scale_[0]
-    scaled_zero = (0.0 - target_mean) / target_std
+    val_dataset = Dataset(
+        data=val_data,
+        lookback=args.lookback,
+        horizon=args.horizon,
+        lookback_cols=args.lookback_cols,
+        horizon_cols=args.horizon_cols,
+        target_col=args.target_col,
+    )
 
-    test_loss, test_preds, test_targets = evaluate_model(model, test_loader, torch.nn.L1Loss(), device)
-    metrics = calculate_metrics(test_loss, test_preds, test_targets, target_mean, target_std, args.nominal_output, scaled_zero)
+    if len(train_dataset) == 0:
+        raise ValueError("Training dataset contains no valid windows.")
+
+    if len(val_dataset) == 0:
+        raise ValueError("Validation dataset contains no valid windows.")
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+    )
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+
+    args.input_size = len(args.lookback_cols)
+    args.output_size = args.horizon
+
+    model = lstm_history.Model(args=args).to(device)
+
+    criterion = torch.nn.L1Loss()
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer=optimizer,
+        T_max=args.epochs,
+        eta_min=args.eta_min,
+    )
+
+    best_val_mae = float("inf")
+    best_model_state = None
+    best_val_metrics = None
+    best_epoch = 0
+
+    patience = getattr(args, "patience", 5)
+    patience_counter = 0
+    print_freq = getattr(args, "print_freq", 1)
+
+    for epoch in range(args.epochs):
+        train_loss, t_preds, t_targets = train_one_epoch(model, train_loader, optimizer, criterion, device)
+
+        val_loss, v_preds, v_targets = evaluate_model(model, val_loader, criterion, device)
+
+        train_metrics = calculate_metrics(t_preds, t_targets, preprocessor, args.nominal_output)
+
+        val_metrics = calculate_metrics(v_preds, v_targets, preprocessor, args.nominal_output)
+
+        if val_metrics["active_mae"] < best_val_mae:
+            best_val_mae = val_metrics["active_mae"]
+            best_model_state = copy.deepcopy(model.state_dict())
+            best_val_metrics = dict(val_metrics)
+            best_epoch = epoch + 1
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        # TensorBoard
+        if writer is not None:
+            writer.add_scalar(
+                "Learning_Rate",
+                scheduler.get_last_lr()[0],
+                epoch,
+            )
+
+            writer.add_scalars(
+                "MAE",
+                {
+                    "Train": train_metrics["mae"],
+                    "Validation": val_metrics["mae"],
+                },
+                epoch,
+            )
+
+            writer.add_scalar(
+                "Validation/R2",
+                val_metrics["r2"],
+                epoch,
+            )
+
+            writer.add_scalar(
+                "Validation/MBE",
+                val_metrics["mbe"],
+                epoch,
+            )
+
+        if (epoch + 1) % print_freq == 0 or epoch == 0:
+            print(
+                f"Epoch {epoch + 1}/{args.epochs} | "
+                f"Val MAE: {val_metrics['mae']:.2f} "
+                f"({val_metrics['nmae']:.2f}%) | "
+                f"Active MAE: {val_metrics['active_mae']:.2f} "
+                f"({val_metrics['active_nmae']:.2f}%) | "
+                f"R²: {val_metrics['r2']:.4f} | "
+                f"MBE: {val_metrics['mbe']:.2f}"
+            )
+
+        scheduler.step()
+
+        if patience_counter >= patience:
+            print(
+                f"Early stopping at epoch {epoch + 1}. "
+                f"Best epoch: {best_epoch}."
+            )
+            break
+
+    if best_model_state is None or best_val_metrics is None:
+        raise RuntimeError("No valid model checkpoint was obtained.")
+
+    model.load_state_dict(best_model_state)
+
+    result = {
+        "model": model,
+        "best_model_state": best_model_state,
+        "preprocessor": preprocessor,
+        "best_epoch": best_epoch,
+        "epochs_trained": epoch + 1,
+    }
+
+    result.update({
+        f"val_{name}": value
+        for name, value in best_val_metrics.items()
+    })
+
+    return result
+
+
+def evaluate_test_set(args, model, history_df: pd.DataFrame, test_df: pd.DataFrame, preprocessor: Preprocessor, device):
+    context = history_df.tail(args.lookback)
+    raw_data = pd.concat([context, test_df])
+
+    test_scaled = raw_data.copy()
+
+    if preprocessor.lookback_cols_to_scale:
+        cols = preprocessor.lookback_cols_to_scale
+        test_scaled[cols] = preprocessor.lookback_scaler.transform(raw_data[cols])
+
+    if preprocessor.horizon_cols_to_scale:
+        cols = preprocessor.horizon_cols_to_scale
+        test_scaled[cols] = preprocessor.horizon_scaler.transform(raw_data[cols])
+
+    test_scaled[[args.target_col]] = (
+        preprocessor.target_scaler.transform(raw_data[[args.target_col]])
+    )
+
+    test_dataset = Dataset(
+        data=test_scaled,
+        lookback=args.lookback,
+        horizon=args.horizon,
+        lookback_cols=args.lookback_cols,
+        horizon_cols=args.horizon_cols,
+        target_col=args.target_col,
+    )
+
+    if len(test_dataset) == 0:
+        raise ValueError("Test dataset contains no valid windows.")
+
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,)
+
+    test_loss, test_preds, test_targets = evaluate_model(
+        model=model,
+        dataloader=test_loader,
+        criterion=torch.nn.L1Loss(),
+        device=device,
+    )
+
+    metrics = calculate_metrics(
+        all_preds=test_preds,
+        all_targets=test_targets,
+        preprocessor=preprocessor,
+        nominal_output=args.nominal_output,
+    )
+
+    print(f"Test loss (scaled): {test_loss:.4f}")
+
+    for name, value in metrics.items():
+        print(f"Test {name}: {value:.4f}")
+
     return metrics
 
 
 # --- OPTUNA CALLBACK ---
 def print_best_callback(study, trial):
-    """It clearly lists the best Trial if the current trial has broken the record."""
     if study.best_trial.number == trial.number:
-        print("\n" + "★"*60)
-        print(f"★★★ NEW BEST TRIAL: {trial.number} ★★★")
-        print(f"Validační MAE: {trial.value:.4f}")
-        print("Test MAE: {:.4f}".format(trial.user_attrs.get('test_mae', float('nan'))))
+        print("\n" + "★" * 60)
+        print(f"NEW BEST TRIAL: {trial.number}")
+        print(f"Validation active MAE: {trial.value:.4f}")
         print("Hyperparameters:")
+
         for key, value in trial.params.items():
             print(f"  {key}: {value}")
-        print("★"*60 + "\n")
+
+        print("★" * 60 + "\n")
 
 
 # --- OPTUNA OBJECTIVE FUNCTION ---
-def objective(trial: optuna.Trial, base_args: argparse.Namespace, dev_df: pd.DataFrame, test_df: pd.DataFrame, device: torch.device) -> float:
+def objective(trial: optuna.Trial, base_args: argparse.Namespace, train_df: pd.DataFrame, dev_df: pd.DataFrame, device: torch.device,) -> float:
     args = copy.deepcopy(base_args)
-    
+
+    # same seed in each trial for better comparasion
+    set_seed(args.seed)
+
     args.epochs = trial.suggest_int("epochs", 10, 30)
+    args.patience = trial.suggest_int("patience", 5, 10)
     args.learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-3, log=True)
     args.weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
-    
-    args.past_hidden_size = trial.suggest_categorical("past_hidden_size", [16, 32, 64, 128])
-    args.past_cnn_filters = trial.suggest_categorical("past_cnn_filters", [16, 32, 64, 128])
-    args.past_num_lstm = trial.suggest_int("past_num_lstm", 1, 3)
-    args.past_dropout = trial.suggest_float("past_dropout", 0.0, 0.5)
-    
-    past_num_cnn = trial.suggest_int("past_num_cnn", 1, 3)
-    for i in range(past_num_cnn):
-        kernel_size = trial.suggest_categorical(f"past_kernel_L{i}", [3, 5, 7])
-        setattr(args, f"past_kernel_L{i}", kernel_size)
-        
-    args.future_hidden_size = trial.suggest_categorical("future_hidden_size", [16, 32, 64, 128])
-    args.future_cnn_filters = trial.suggest_categorical("future_cnn_filters", [16, 32, 64, 128])
-    args.future_num_lstm = trial.suggest_int("future_num_lstm", 1, 3)
-    args.future_dropout = trial.suggest_float("future_dropout", 0.0, 0.5)
-    
-    future_num_cnn = trial.suggest_int("future_num_cnn", 1, 3)
-    for j in range(future_num_cnn):
-        kernel_size = trial.suggest_categorical(f"future_kernel_L{j}", [3, 5, 7])
-        setattr(args, f"future_kernel_L{j}", kernel_size)
-
-    args.attention_dim = trial.suggest_categorical("attention_dim", [32, 64, 128])
-    args.decoder_dropout = trial.suggest_float("decoder_dropout", 0.0, 0.5)
-    
+    args.hidden_size = trial.suggest_categorical("hidden_size", [16, 32, 64, 128, 256])
+    args.dropout = trial.suggest_float("dropout", 0.0, 0.5)
+    args.is_bidirectional = trial.suggest_categorical("is_bidirectional", [True, False])
     args.lookback = trial.suggest_categorical("lookback", [24, 48, 72])
-    args.horizon = trial.suggest_categorical("horizon", [24, 36, 48])
-    
-    print(f"\n{'-'*40}\n[Trial {trial.number}] Spouštím konfiguraci:\n{json.dumps(trial.params, indent=2)}")
-    
-    splitter = Splitter(data=dev_df)
-    df_splits = splitter.get_splits(strategy=args.strategy, initial_train_size=args.initial_train_size, step_size=args.step_size, window_size=args.step_size)
-    
-    best_state, final_preprocessor, _, avg_val_mae, avg_val_r2, avg_val_mbe, avg_val_active_mae, avg_val_active_mae_pct = run_cross_validation(
-        args, df_splits, writer=None, device=device
-    )
-    
-    test_mae, test_r2, test_mbe, test_active_mae, test_active_mae_pct = float('inf'), 0.0, 0.0, float('inf'), 0.0
-    
-    if best_state is not None:
-        test_model = model_attention.Model(args=args).to(device)
-        test_model.load_state_dict(best_state)
-        test_metrics = evaluate_test_set(args, test_model, test_df, final_preprocessor, device)
-        
-        test_mae = test_metrics["real_mae"]
-        test_r2 = test_metrics["r2"]
-        test_mbe = test_metrics["mbe"]
-        test_active_mae = test_metrics["real_active_mae"]
-        test_active_mae_pct = test_metrics["active_mae_pct"]
-        
-    print(f"\n>> [Trial {trial.number} VÝSLEDKY]:")
-    print(f"   VALIDATION -> Average MAE: {avg_val_mae:.2f} | Active MAE: {avg_val_active_mae:.2f} ({avg_val_active_mae_pct:.2f}%) | R²: {avg_val_r2:.4f} | MBE: {avg_val_mbe:.2f}")
-    print(f"   TEST       ->   Final MAE: {test_mae:.2f} | Active MAE: {test_active_mae:.2f} ({test_active_mae_pct:.2f}%) | R²: {test_r2:.4f} | MBE: {test_mbe:.2f}")
-    
-    trial.set_user_attr("val_active_mae", avg_val_active_mae)
-    trial.set_user_attr("val_active_mae_pct", avg_val_active_mae_pct)
-    trial.set_user_attr("val_r2", avg_val_r2)
-    trial.set_user_attr("val_mbe", avg_val_mbe)
-    trial.set_user_attr("test_mae", test_mae)
-    trial.set_user_attr("test_active_mae", test_active_mae)
-    trial.set_user_attr("test_active_mae_pct", test_active_mae_pct)
-    trial.set_user_attr("test_r2", test_r2)
-    trial.set_user_attr("test_mbe", test_mbe)
-    
-    return avg_val_mae
+
+    result = run_validation(args=args, train_df=train_df, dev_df=dev_df, writer=None, device=device)
+
+    print(f"\nTrial {trial.number} – Validation's metrics:")
+
+    for name, value in result.items():
+        if name.startswith("val_") and isinstance(value, (int, float, np.integer, np.floating)):
+            print(f"{name}: {value:.4f}")
+            trial.set_user_attr(name, float(value))
+
+    return float(result["val_active_mae"])
 
 
 def main(args: argparse.Namespace) -> None:
@@ -337,21 +437,21 @@ def main(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Starting Optuna optimization on the device: {device}")
 
-    dev_df, test_df = load_dataset(args.test_ratio)
+    train_df, dev_df, test_df = load_dataset(args.test_ratio, args.dataset_path)
     
     study = optuna.create_study(
-        study_name="fve_attention_study",    
+        study_name="lstm_history",    
         storage="sqlite:///optuna_study.db", 
         load_if_exists=True,              
         direction="minimize"
     )
     
-    study.optimize(lambda trial: objective(trial, args, dev_df, test_df, device), n_trials=100, callbacks=[print_best_callback])
+    study.optimize(lambda trial: objective(trial, args, train_df, dev_df, device), n_trials=100, callbacks=[print_best_callback])
     
     print("\n" + "="*60)
     print("OPTUNA OPTIMIZATION COMPLETED!")
     print(f"Best Trial number: {study.best_trial.number}")
-    print(f"Best achieved Validation MAE: {study.best_value:.2f}")
+    print(f"Best achieved Validation active MAE: {study.best_value:.2f}")
     print("\nThe winning combination of hyperparameters:")
     for key, value in study.best_params.items():
         print(f"  {key}: {value}")

@@ -10,7 +10,37 @@ class Dataset(torch.utils.data.Dataset):
     context (horizon) to support multi-modal or encoder-decoder forecasting models.
     """
     def __init__(self, data: pd.DataFrame, lookback: int, horizon: int, lookback_cols: list[str], horizon_cols: list[str], target_col: str, expected_freq: str = '1h'):
-        """Initializes the FVEDataset with rigorous data validation and sliding window preprocessing."""
+        """
+        Initializes the FVEDataset with rigorous data validation and sliding window preprocessing.
+        Args:
+        data (pd.DataFrame):
+            Time-indexed DataFrame containing historical observations,
+            optional future meteorological forecasts, and target values.
+            The index must be a monotonically increasing DatetimeIndex
+            with no duplicate timestamps.
+
+        lookback (int):
+            Number of past time steps used as historical input.
+
+        horizon (int):
+            Number of future time steps to predict.
+
+        lookback_cols (list[str]):
+            Names of columns used as historical input features.
+
+        horizon_cols (list[str] | None):
+            Names of columns containing known future input features,
+            such as numerical weather predictions. If None or empty,
+            no future input features are used.
+
+        target_col (str):
+            Name of the column containing the target variable, such as
+            photovoltaic power or energy production.
+
+        expected_freq (str, optional):
+            Expected time interval between consecutive observations.
+            Defaults to "1h".
+        """
         
         if not isinstance(data.index, pd.DatetimeIndex):
             raise TypeError(
@@ -51,7 +81,7 @@ class Dataset(torch.utils.data.Dataset):
         self.horizon_cols = horizon_cols
         self.target_col = target_col
 
-        used_cols = list(set(lookback_cols + horizon_cols + [target_col]))
+        used_cols = list(set((lookback_cols or []) + (horizon_cols or []) + [target_col]))
         has_nan = data[used_cols].isna().any(axis=1)
 
         total_window = lookback + horizon
@@ -68,29 +98,21 @@ class Dataset(torch.utils.data.Dataset):
 
         return len(self.valid_indices)
 
-    def __getitem__(self, index):
-        """Generates one valid sample from the dataset at the given PyTorch index.
+    def __getitem__(self, index) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        start_idx = int(self.valid_indices[index])
 
-        Args:
-            index (int): The index of the valid sample (provided by DataLoader).
+        past_end = start_idx + self.lookback
+        future_end = past_end + self.horizon
 
-        Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
-                - x_past (torch.Tensor): Historical features of shape (lookback, len(lookback_cols)).
-                - x_future (torch.Tensor): Known future features of shape (horizon, len(horizon_cols)).
-                - y_target (torch.Tensor): Target values to predict of shape (horizon,).
-        """
-        start_idx = self.valid_indices[index]
+        past_window = self.data.iloc[start_idx:past_end]
+        future_window = self.data.iloc[past_end:future_end]
 
-        past_window = self.data.iloc[start_idx : start_idx + self.lookback]
-        future_window = self.data.iloc[start_idx + self.lookback : start_idx + self.lookback + self.horizon]
-
-        x_past = past_window[self.lookback_cols].values.astype(np.float32)
-        x_future = future_window[self.horizon_cols].values.astype(np.float32)
-        y_target = future_window[self.target_col].values.astype(np.float32)
+        x_past = past_window[self.lookback_cols].to_numpy(dtype=np.float32)
+        x_future = future_window[self.horizon_cols].to_numpy(dtype=np.float32)
+        y_target = future_window[self.target_col].to_numpy(dtype=np.float32)
 
         return (
-            torch.from_numpy(x_past),
-            torch.from_numpy(x_future),
-            torch.from_numpy(y_target)
+            torch.from_numpy(np.ascontiguousarray(x_past)),
+            torch.from_numpy(np.ascontiguousarray(x_future)),
+            torch.from_numpy(np.ascontiguousarray(y_target)),
         )
