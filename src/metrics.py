@@ -1,3 +1,4 @@
+# metrics.py
 """Evaluation metrics for PV forecasting models.
 
 This module contains:
@@ -18,9 +19,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score
-from src.preprocessing import Preprocessor
 
-def calculate_metrics(all_preds: np.ndarray, all_targets: np.ndarray, preprocessor: Preprocessor, nominal_output: float,) -> dict[str, float]:
+
+def calculate_metrics(all_preds: np.ndarray, all_targets: np.ndarray, preprocessor: Any, nominal_output: float) -> dict[str, float]:
     """Calculate overall and active-hour metrics from scaled arrays.
 
     Predictions and targets are inverse-transformed through ``preprocessor``
@@ -86,7 +87,7 @@ def calculate_metrics(all_preds: np.ndarray, all_targets: np.ndarray, preprocess
     }
 
 
-def calculate_metrics_unscaled(y_targets: np.ndarray | pd.Series, y_preds: np.ndarray | pd.Series, nominal_power: float = 1293.0,) -> dict[str, float | int]:
+def calculate_metrics_unscaled(y_targets: np.ndarray | pd.Series, y_preds: np.ndarray | pd.Series, nominal_power: float = 1293.0) -> dict[str, float | int]:
     """Calculate metrics for targets and predictions in original units."""
     targets = np.asarray(y_targets, dtype=float).reshape(-1)
     preds = np.asarray(y_preds, dtype=float).reshape(-1)
@@ -240,3 +241,86 @@ def calculate_all_metrics(X_unscaled: pd.DataFrame, y_targets: np.ndarray, y_pre
         "seasonal_all": pd.DataFrame.from_dict(seasonal_all, orient="index"),
         "seasonal_active": pd.DataFrame.from_dict(seasonal_active, orient="index"),
     }
+
+def calculate_metrics_by_horizon(X_unscaled: pd.DataFrame, y_targets: np.ndarray, y_preds: np.ndarray, target_times: np.ndarray, nominal_power: float = 1293.0, cloud_col: str = "Forecast cloud_cover") -> dict[str, pd.DataFrame]:
+    """Calculate detailed metrics separately for each forecast lead time.
+
+    The input arrays should have shape ``(n_windows, horizon)``.
+    Column 0 means the first predicted hour, column 1 the second, and so on.
+    For each lead time, this function computes the same overall, active-hour,
+    cloud-cover, and seasonal breakdowns as :func:`calculate_all_metrics`.
+
+    Returns DataFrames indexed by ``horizon_hour`` (1..horizon), or by
+    ``(horizon_hour, season)`` for seasonal metrics.
+    """
+    targets = np.asarray(y_targets, dtype=float)
+    preds = np.asarray(y_preds, dtype=float)
+    times = np.asarray(target_times)
+
+    if targets.ndim == 1:
+        targets = targets.reshape(-1, 1)
+    if preds.ndim == 1:
+        preds = preds.reshape(-1, 1)
+    if times.ndim == 1:
+        times = times.reshape(-1, 1)
+
+    if targets.ndim != 2 or preds.ndim != 2 or times.ndim != 2:
+        raise ValueError("Targets, predictions, and target_times must be 2D arrays.")
+    if targets.shape != preds.shape or targets.shape != times.shape:
+        raise ValueError(
+            f"Targets, predictions, and timestamps must have the same shape; "
+            f"got {targets.shape}, {preds.shape}, and {times.shape}."
+        )
+    if targets.shape[1] == 0:
+        raise ValueError("Forecast horizon cannot be empty.")
+
+    scalar_groups = (
+        "overall", "active", "clear_sky", "variable_sky", "cloudy_sky"
+    )
+    scalar_rows: dict[str, list[dict[str, float | int]]] = {
+        name: [] for name in scalar_groups
+    }
+    seasonal_all_rows: list[pd.DataFrame] = []
+    seasonal_active_rows: list[pd.DataFrame] = []
+
+    for step in range(targets.shape[1]):
+        one_step = calculate_all_metrics(
+            X_unscaled=X_unscaled,
+            y_targets=targets[:, step],
+            y_preds=preds[:, step],
+            target_times=times[:, step],
+            nominal_power=nominal_power,
+            cloud_col=cloud_col,
+        )
+        horizon_hour = step + 1
+
+        for group_name in scalar_groups:
+            row = {"horizon_hour": horizon_hour}
+            row.update(one_step[group_name])
+            scalar_rows[group_name].append(row)
+
+        for source_name, destination in (
+            ("seasonal_all", seasonal_all_rows),
+            ("seasonal_active", seasonal_active_rows),
+        ):
+            seasonal = one_step[source_name].copy()
+            if not seasonal.empty:
+                seasonal["season"] = seasonal.index
+                seasonal["horizon_hour"] = horizon_hour
+                destination.append(seasonal.reset_index(drop=True))
+
+    result: dict[str, pd.DataFrame] = {}
+    for group_name, rows in scalar_rows.items():
+        result[f"by_horizon_{group_name}"] = pd.DataFrame(rows).set_index("horizon_hour")
+
+    for key, rows in (
+        ("by_horizon_seasonal_all", seasonal_all_rows),
+        ("by_horizon_seasonal_active", seasonal_active_rows),
+    ):
+        if rows:
+            frame = pd.concat(rows, ignore_index=True)
+            result[key] = frame.set_index(["horizon_hour", "season"]).sort_index()
+        else:
+            result[key] = pd.DataFrame()
+
+    return result

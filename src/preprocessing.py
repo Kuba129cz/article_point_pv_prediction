@@ -49,30 +49,87 @@ class Preprocessor:
         # Z-score: (x - mean) / std
         return (0.0 - self.target_scaler.mean_[0]) / self.target_scaler.scale_[0]
     
-    def fit_and_transform(self, train_df: pd.DataFrame, val_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def fit_and_transform(self,train_df: pd.DataFrame,val_df: pd.DataFrame,test_df: pd.DataFrame = None,) -> tuple[pd.DataFrame, ...]:
         """
-        Fits scalers on training data and transforms both training and validation sets.
-
-        Args:
-            train_df: Training DataFrame containing all necessary features.
-            val_df: Validation DataFrame.
+        Fits scalers exclusively on training data and transforms the
+        training, validation, and optionally test DataFrames.
 
         Returns:
-            A tuple of (train_scaled, val_scaled) DataFrames.
+            If test_df is provided:
+                (train_scaled, val_scaled, test_scaled)
+            Otherwise:
+                (train_scaled, val_scaled)
         """
         train_scaled = train_df.copy()
         val_scaled = val_df.copy()
+        test_scaled = test_df.copy() if test_df is not None else None
 
+        # 1. Scale historical input features.
         if self.lookback_cols_to_scale:
-            train_scaled[self.lookback_cols_to_scale] = self.lookback_scaler.fit_transform(train_df[self.lookback_cols_to_scale])
-            val_scaled[self.lookback_cols_to_scale] = self.lookback_scaler.transform(val_df[self.lookback_cols_to_scale])
+            train_scaled[self.lookback_cols_to_scale] = (
+                self.lookback_scaler.fit_transform(
+                    train_df[self.lookback_cols_to_scale]
+                )
+            )
 
+            val_scaled[self.lookback_cols_to_scale] = (
+                self.lookback_scaler.transform(
+                    val_df[self.lookback_cols_to_scale]
+                )
+            )
+
+            if test_scaled is not None:
+                test_scaled[self.lookback_cols_to_scale] = (
+                    self.lookback_scaler.transform(
+                        test_df[self.lookback_cols_to_scale]
+                    )
+                )
+
+        # 2. Scale known future features.
+        # Always transform the ORIGINAL DataFrames, not already-scaled values.
         if self.horizon_cols_to_scale:
-            train_scaled[self.horizon_cols_to_scale] = self.horizon_scaler.fit_transform(train_df[self.horizon_cols_to_scale])
-            val_scaled[self.horizon_cols_to_scale] = self.horizon_scaler.transform(val_df[self.horizon_cols_to_scale])
+            train_scaled[self.horizon_cols_to_scale] = (
+                self.horizon_scaler.fit_transform(
+                    train_df[self.horizon_cols_to_scale]
+                )
+            )
 
-        train_scaled[[self.target_col]] = self.target_scaler.fit_transform(train_df[[self.target_col]])
-        val_scaled[[self.target_col]] = self.target_scaler.transform(val_df[[self.target_col]])
+            val_scaled[self.horizon_cols_to_scale] = (
+                self.horizon_scaler.transform(
+                    val_df[self.horizon_cols_to_scale]
+                )
+            )
+
+            if test_scaled is not None:
+                test_scaled[self.horizon_cols_to_scale] = (
+                    self.horizon_scaler.transform(
+                        test_df[self.horizon_cols_to_scale]
+                    )
+                )
+
+        # 3. Scale the target using training target statistics only.
+        train_scaled[[self.target_col]] = (
+            self.target_scaler.fit_transform(
+                train_df[[self.target_col]]
+            )
+        )
+
+        val_scaled[[self.target_col]] = (
+            self.target_scaler.transform(
+                val_df[[self.target_col]]
+            )
+        )
+
+        if test_scaled is not None:
+            test_scaled[[self.target_col]] = (
+                self.target_scaler.transform(
+                    test_df[[self.target_col]]
+                )
+            )
+
+        # 4. Return two or three DataFrames depending on the input.
+        if test_scaled is not None:
+            return train_scaled, val_scaled, test_scaled
 
         return train_scaled, val_scaled
 

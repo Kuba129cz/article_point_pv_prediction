@@ -1,19 +1,25 @@
+import argparse
+import copy
+import json
+import os
+import random
+from datetime import datetime
+from typing import Any
+
+import joblib
+import numpy as np
+import pandas as pd
 import torch
 from torch.utils.tensorboard import SummaryWriter
-import pandas as pd
-import numpy as np
-import argparse
-import random
-import os
-import copy
-from datetime import datetime
-import json
-import optuna
-from sklearn.metrics import r2_score
 
 from src.preprocessing import Preprocessor
 from src.dataset import Dataset
-from src.models import cnnlstm
+from src.models import lstm_history
+from src.metrics import (
+    calculate_metrics,
+    calculate_all_metrics,
+    calculate_metrics_by_horizon,
+)
 
 parser = argparse.ArgumentParser()
 
@@ -79,65 +85,6 @@ def load_dataset(dataset_path: str,) -> tuple[pd.DataFrame, pd.DataFrame, pd.Dat
 
     return train, val, test
 
-# def calculate_metrics(all_preds: np.ndarray, all_targets: np.ndarray, preprocessor: Preprocessor, nominal_output: float) -> dict[str, float]:
-#     if nominal_output <= 0:
-#         raise ValueError("nominal_output has to be higher than 0.")
-
-#     real_preds = preprocessor.inverse_transform_target(all_preds)
-#     real_targets = preprocessor.inverse_transform_target(all_targets)
-
-#     preds = real_preds.reshape(-1)
-#     targets = real_targets.reshape(-1)
-
-#     errors = preds - targets
-#     abs_errors = np.abs(errors)
-
-#     mae = np.mean(abs_errors)
-#     rmse = np.sqrt(np.mean(errors ** 2))
-#     r2 = r2_score(targets, preds)
-#     mbe = np.mean(errors)
-
-#     nmae = (mae / nominal_output) * 100
-#     nrmse = (rmse / nominal_output) * 100
-
-#     mask = targets > 0.1
-
-#     if np.any(mask):
-#         active_errors = errors[mask]
-
-#         active_mae = np.mean(np.abs(active_errors))
-#         active_rmse = np.sqrt(np.mean(active_errors ** 2))
-
-#         active_nmae = 100 * active_mae / nominal_output
-#         active_nrmse = 100 * active_rmse / nominal_output
-
-#         active_r2 = r2_score(targets[mask], preds[mask])
-#         active_mbe = np.mean(active_errors)
-#     else:
-#         active_mae = np.nan
-#         active_rmse = np.nan
-#         active_nmae = np.nan
-#         active_nrmse = np.nan
-#         active_r2 = np.nan
-#         active_mbe = np.nan
-
-#     return {
-#         "mae": float(mae),
-#         "rmse": float(rmse),
-#         "nmae": float(nmae),
-#         "nrmse": float(nrmse),
-#         "r2": float(r2),
-#         "mbe": float(mbe),
-
-#         "active_mae": float(active_mae),
-#         "active_rmse": float(active_rmse),
-#         "active_nmae": float(active_nmae),
-#         "active_nrmse": float(active_nrmse),
-#         "active_r2": float(active_r2),
-#         "active_mbe": float(active_mbe),
-#     }
-
-
 def train_one_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0.0
@@ -178,222 +125,6 @@ def evaluate_model(model, dataloader, criterion, device):
     return total_loss / len(dataloader.dataset), np.concatenate(all_preds), np.concatenate(all_targets)
 
 
-def run_train(args, train_df: pd.DataFrame, dev_df: pd.DataFrame, writer, device):
-    preprocessor = Preprocessor(lookback_cols=args.lookback_cols, horizon_cols=args.horizon_cols, target_col=args.target_col)
-
-    train_scaled, val_scaled = preprocessor.fit_and_transform(train_df=train_df, val_df=dev_df)
-
-    if args.lookback > 0:
-        val_data = pd.concat([train_scaled.tail(args.lookback), val_scaled])
-    else:
-        val_data = val_scaled.copy()
-
-    train_dataset = Dataset(
-        data=train_scaled,
-        lookback=args.lookback,
-        horizon=args.horizon,
-        lookback_cols=args.lookback_cols,
-        horizon_cols=args.horizon_cols,
-        target_col=args.target_col,
-    )
-
-    val_dataset = Dataset(
-        data=val_data,
-        lookback=args.lookback,
-        horizon=args.horizon,
-        lookback_cols=args.lookback_cols,
-        horizon_cols=args.horizon_cols,
-        target_col=args.target_col,
-    )
-
-    if len(train_dataset) == 0:
-        raise ValueError("Training dataset contains no valid windows.")
-
-    if len(val_dataset) == 0:
-        raise ValueError("Validation dataset contains no valid windows.")
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-    )
-
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-    )
-
-    args.input_size = len(args.lookback_cols) + len(args.horizon_cols)
-    args.output_size = args.horizon
-
-    model = cnnlstm.Model(args=args).to(device)
-
-    criterion = torch.nn.L1Loss()
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer=optimizer,
-        T_max=args.epochs,
-        eta_min=args.eta_min,
-    )
-
-    best_val_mae = float("inf")
-    best_model_state = None
-    best_val_metrics = None
-    best_epoch = 0
-
-    patience = getattr(args, "patience", 5)
-    patience_counter = 0
-    print_freq = getattr(args, "print_freq", 1)
-
-    for epoch in range(args.epochs):
-        train_loss, t_preds, t_targets = train_one_epoch(model, train_loader, optimizer, criterion, device)
-
-        val_loss, v_preds, v_targets = evaluate_model(model, val_loader, criterion, device)
-
-        train_metrics = calculate_metrics(t_preds, t_targets, preprocessor, args.nominal_output)
-
-        val_metrics = calculate_metrics(v_preds, v_targets, preprocessor, args.nominal_output)
-
-        if val_metrics["active_mae"] < best_val_mae:
-            best_val_mae = val_metrics["active_mae"]
-            best_model_state = copy.deepcopy(model.state_dict())
-            best_val_metrics = dict(val_metrics)
-            best_epoch = epoch + 1
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        # TensorBoard
-        if writer is not None:
-            writer.add_scalar(
-                "Learning_Rate",
-                scheduler.get_last_lr()[0],
-                epoch,
-            )
-
-            writer.add_scalars(
-                "MAE",
-                {
-                    "Train": train_metrics["mae"],
-                    "Validation": val_metrics["mae"],
-                },
-                epoch,
-            )
-
-            writer.add_scalar(
-                "Validation/R2",
-                val_metrics["r2"],
-                epoch,
-            )
-
-            writer.add_scalar(
-                "Validation/MBE",
-                val_metrics["mbe"],
-                epoch,
-            )
-
-        if (epoch + 1) % print_freq == 0 or epoch == 0:
-            print(
-                f"Epoch {epoch + 1}/{args.epochs} | "
-                f"Val MAE: {val_metrics['mae']:.2f} "
-                f"({val_metrics['nmae']:.2f}%) | "
-                f"Active MAE: {val_metrics['active_mae']:.2f} "
-                f"({val_metrics['active_nmae']:.2f}%) | "
-                f"R²: {val_metrics['r2']:.4f} | "
-                f"MBE: {val_metrics['mbe']:.2f}"
-            )
-
-        scheduler.step()
-
-        if patience_counter >= patience:
-            print(
-                f"Early stopping at epoch {epoch + 1}. "
-                f"Best epoch: {best_epoch}."
-            )
-            break
-
-    if best_model_state is None or best_val_metrics is None:
-        raise RuntimeError("No valid model checkpoint was obtained.")
-
-    model.load_state_dict(best_model_state)
-
-    result = {
-        "model": model,
-        "best_model_state": best_model_state,
-        "preprocessor": preprocessor,
-        "best_epoch": best_epoch,
-        "epochs_trained": epoch + 1,
-    }
-
-    result.update({
-        f"val_{name}": value
-        for name, value in best_val_metrics.items()
-    })
-
-    return model
-
-
-def evaluate_test_set(args, model, history_df: pd.DataFrame, test_df: pd.DataFrame, preprocessor: Preprocessor, device):
-    context = history_df.tail(args.lookback)
-    raw_data = pd.concat([context, test_df])
-
-    test_scaled = raw_data.copy()
-
-    if preprocessor.lookback_cols_to_scale:
-        cols = preprocessor.lookback_cols_to_scale
-        test_scaled[cols] = preprocessor.lookback_scaler.transform(raw_data[cols])
-
-    if preprocessor.horizon_cols_to_scale:
-        cols = preprocessor.horizon_cols_to_scale
-        test_scaled[cols] = preprocessor.horizon_scaler.transform(raw_data[cols])
-
-    test_scaled[[args.target_col]] = (
-        preprocessor.target_scaler.transform(raw_data[[args.target_col]])
-    )
-
-    test_dataset = Dataset(
-        data=test_scaled,
-        lookback=args.lookback,
-        horizon=args.horizon,
-        lookback_cols=args.lookback_cols,
-        horizon_cols=args.horizon_cols,
-        target_col=args.target_col,
-    )
-
-    if len(test_dataset) == 0:
-        raise ValueError("Test dataset contains no valid windows.")
-
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,)
-
-    test_loss, test_preds, test_targets = evaluate_model(
-        model=model,
-        dataloader=test_loader,
-        criterion=torch.nn.L1Loss(),
-        device=device,
-    )
-
-    metrics = calculate_metrics(
-        all_preds=test_preds,
-        all_targets=test_targets,
-        preprocessor=preprocessor,
-        nominal_output=args.nominal_output,
-    )
-
-    print(f"Test loss (scaled): {test_loss:.4f}")
-
-    for name, value in metrics.items():
-        print(f"Test {name}: {value:.4f}")
-
-    return metrics
-
-
 def save_model(model: torch.nn.Module, args: argparse.Namespace, path_dir: str)-> None:
     os.makedirs(path_dir, exist_ok=True) # Zabezpečení, že složka existuje
     torch.save(model.state_dict(), f"{path_dir}/model.pth")
@@ -412,8 +143,163 @@ def load_model(path_dir: str, device: torch.device) -> torch.nn.Module:
     
     return model
 
+def build_target_times(
+    data: pd.DataFrame,
+    n_windows: int,
+    lookback: int,
+    horizon: int,
+    lookback_cols: list[str],
+    horizon_cols: list[str],
+    target_col: str,
+) -> np.ndarray:
+    """Create target timestamps for valid stride-1 rolling windows.
+
+    Candidate window i uses rows [i:i+lookback] as historical input and
+    [i+lookback:i+lookback+horizon] as its target horizon. The helper removes
+    candidates with non-finite values in the columns used by Dataset. This
+    supports Dataset implementations that skip invalid windows. If its filtering
+    policy differs, the count check below raises instead of silently misaligning
+    timestamps and predictions.
+    """
+    index = pd.DatetimeIndex(pd.to_datetime(data.index, utc=True))
+    missing_cols = [c for c in [*lookback_cols, *horizon_cols, target_col] if c not in data.columns]
+    if missing_cols:
+        raise ValueError(f"Cannot align forecast times; missing dataset columns: {missing_cols}")
+
+    n_candidates = len(data) - lookback - horizon + 1
+    if n_candidates < 1:
+        raise ValueError(
+            f"Not enough rows to create windows: rows={len(data)}, lookback={lookback}, horizon={horizon}."
+        )
+
+    # Prepare arrays once. These checks mirror a typical Dataset that skips any
+    # window containing NaN/inf in model inputs or target values.
+    lookback_values = data[lookback_cols].to_numpy(dtype=float) if lookback_cols else np.empty((len(data), 0))
+    horizon_values = data[horizon_cols].to_numpy(dtype=float) if horizon_cols else np.empty((len(data), 0))
+    target_values = data[target_col].to_numpy(dtype=float)
+
+    valid_starts: list[int] = []
+    for start in range(n_candidates):
+        past_end = start + lookback
+        target_end = past_end + horizon
+
+        past_ok = np.isfinite(lookback_values[start:past_end]).all()
+        future_ok = np.isfinite(horizon_values[past_end:target_end]).all()
+        target_ok = np.isfinite(target_values[past_end:target_end]).all()
+        if past_ok and future_ok and target_ok:
+            valid_starts.append(start)
+
+    if len(valid_starts) != n_windows:
+        raise ValueError(
+            "Unable to align target timestamps with Dataset windows. "
+            f"Dataset returned {n_windows} windows, but checking finite values in the configured model "
+            f"columns found {len(valid_starts)} valid windows (from {n_candidates} candidates). "
+            "The filtering rules in src.dataset.Dataset may differ from this helper; align those rules "
+            "before interpreting cloud-cover, seasonal, or horizon-specific metrics."
+        )
+
+    # Metrics parses these datetime64 timestamps as UTC.
+    index_utc_naive = index.tz_convert("UTC").tz_localize(None)
+    return np.stack(
+        [index_utc_naive[start + lookback : start + lookback + horizon].to_numpy()
+         for start in valid_starts],
+        axis=0,
+    )
+
+
+def save_detailed_results(
+    output_dir: str,
+    split_name: str,
+    detailed: dict[str, Any],
+    by_horizon: dict[str, pd.DataFrame],
+) -> None:
+    """Save scalar metric groups to JSON and seasonal / horizon tables to CSV."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    scalar_result = {
+        key: value
+        for key, value in detailed.items()
+        if isinstance(value, dict)
+    }
+    with open(os.path.join(output_dir, f"{split_name}_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(scalar_result, f, indent=2, allow_nan=True)
+
+    for key, value in detailed.items():
+        if isinstance(value, pd.DataFrame):
+            value.to_csv(os.path.join(output_dir, f"{split_name}_{key}.csv"), index=True)
+
+    for key, value in by_horizon.items():
+        value.to_csv(os.path.join(output_dir, f"{split_name}_{key}.csv"), index=True)
+
+def print_detailed_results(split_name: str, detailed: dict[str, Any], by_horizon: dict[str, pd.DataFrame]) -> None:
+    title = split_name.replace("_", " ").title()
+    for key in ("overall", "active", "clear_sky", "variable_sky", "cloudy_sky"):
+        print(f"\n{title} — {key}:")
+        print(pd.Series(detailed[key]).to_string())
+
+    for key in ("seasonal_all", "seasonal_active"):
+        print(f"\n{title} — {key}:")
+        print(detailed[key].to_string())
+
+    print(f"\n{title} — MAE by forecast horizon:")
+    print(by_horizon["by_horizon_overall"][["N", "mae", "rmse", "nmae", "nrmse", "r2", "mbe"]].to_string())
+    print(f"\n{title} — Active MAE by forecast horizon:")
+    print(by_horizon["by_horizon_active"][["N", "active_mae", "active_rmse", "active_nmae", "active_nrmse", "active_r2", "active_mbe"]].to_string())
+
+def run_detailed_evaluation(
+    *,
+    split_name: str,
+    raw_features: pd.DataFrame,
+    data_with_context: pd.DataFrame,
+    dataset: Dataset,
+    dataloader,
+    model: torch.nn.Module,
+    preprocessor: Preprocessor,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> None:
+    loss, preds_scaled, targets_scaled = evaluate_model(
+        model=model,
+        dataloader=dataloader,
+        criterion=torch.nn.L1Loss(),
+        device=device,
+    )
+    preds = preprocessor.inverse_transform_target(preds_scaled)
+    targets = preprocessor.inverse_transform_target(targets_scaled)
+    target_times = build_target_times(
+        data=data_with_context,
+        n_windows=len(dataset),
+        lookback=args.lookback,
+        horizon=args.horizon,
+        lookback_cols=args.lookback_cols,
+        horizon_cols=args.horizon_cols,
+        target_col=args.target_col,
+    )
+
+    detailed = calculate_all_metrics(
+        X_unscaled=raw_features,
+        y_targets=targets,
+        y_preds=preds,
+        target_times=target_times,
+        nominal_power=args.nominal_output,
+        cloud_col=args.cloud_col,
+    )
+    by_horizon = calculate_metrics_by_horizon(
+        X_unscaled=raw_features,
+        y_targets=targets,
+        y_preds=preds,
+        target_times=target_times,
+        nominal_power=args.nominal_output,
+        cloud_col=args.cloud_col,
+    )
+
+    print(f"\n{split_name.title()} loss (scaled): {loss:.6f}")
+    print_detailed_results(split_name, detailed, by_horizon)
+    save_detailed_results(args.path_dir, split_name, detailed, by_horizon)
+
 def main(args: argparse.Namespace) -> None:
     set_seed(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Starting on the device: {device}")
 
@@ -421,10 +307,133 @@ def main(args: argparse.Namespace) -> None:
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     writer = SummaryWriter(log_dir=f"runs/{args.exp_name}_{timestamp}")
+    try:
+        preprocessor = Preprocessor(lookback_cols=args.lookback_cols, horizon_cols=args.horizon_cols, target_col=args.target_col)
 
-    model = run_train(args=args, train_df=train_df, dev_df=dev_df, writer=writer, device=device)
-    print("Saving the model..")
-    save_model(model, args, args.path_dir)
+        train_scaled, val_scaled, test_scaled = preprocessor.fit_and_transform(train_df=train_df, val_df=dev_df, test_df=test_df)
+
+        train_dataset = Dataset(data=train_scaled, lookback=args.lookback, horizon=args.horizon, lookback_cols=args.lookback_cols, horizon_cols=args.horizon_cols, target_col=args.target_col)
+        val_dataset = Dataset(data=val_scaled, lookback=args.lookback, horizon=args.horizon, lookback_cols=args.lookback_cols, horizon_cols=args.horizon_cols, target_col=args.target_col)
+        test_dataset = Dataset(data=test_scaled, lookback=args.lookback, horizon=args.horizon, lookback_cols=args.lookback_cols, horizon_cols=args.horizon_cols, target_col=args.target_col)
+
+        if len(train_dataset) == 0:
+            raise ValueError("Training dataset contains no valid windows.")
+
+        if len(val_dataset) == 0:
+            raise ValueError("Validation dataset contains no valid windows.")
+
+        if len(test_dataset) == 0:
+            raise ValueError("Validation dataset contains no valid windows.")
+
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+
+        args.input_size = len(args.lookback_cols) + len(args.horizon_cols)
+        model = lstm_history.Model(args=args).to(device)
+
+        criterion = torch.nn.L1Loss()
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=args.epochs, eta_min=args.eta_min)
+
+        best_val_mae = float("inf")
+        best_model_state = None
+        best_val_metrics = None
+        best_epoch = 0
+
+        patience = getattr(args, "patience", 5)
+        patience_counter = 0
+        print_freq = getattr(args, "print_freq", 1)
+
+        for epoch in range(args.epochs):
+            train_loss, t_preds, t_targets = train_one_epoch(model, train_loader, optimizer, criterion, device)
+            val_loss, v_preds, v_targets = evaluate_model(model, val_loader, criterion, device)
+
+            # Quick per-epoch metrics from src.metrics; arrays are inverse-transformed there.
+            train_metrics = calculate_metrics(t_preds, t_targets, preprocessor, args.nominal_output)
+            val_metrics = calculate_metrics(v_preds, v_targets, preprocessor, args.nominal_output)
+
+            if val_metrics["active_mae"] < best_val_mae:
+                best_val_mae = val_metrics["active_mae"]
+                best_model_state = copy.deepcopy(model.state_dict())
+                best_val_metrics = dict(val_metrics)
+                best_epoch = epoch + 1
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if writer is not None:
+                writer.add_scalar("Loss/Train_scaled", train_loss, epoch)
+                writer.add_scalar("Loss/Validation_scaled", val_loss, epoch)
+                writer.add_scalar("Learning_Rate", scheduler.get_last_lr()[0], epoch)
+                writer.add_scalars("MAE", {"Train": train_metrics["mae"], "Validation": val_metrics["mae"]}, epoch)
+                writer.add_scalar("Validation/R2", val_metrics["r2"], epoch)
+                writer.add_scalar("Validation/MBE", val_metrics["mbe"], epoch)
+                writer.add_scalar("Validation/Active_MAE", val_metrics["active_mae"], epoch)
+
+            if (epoch + 1) % args.print_freq == 0 or epoch == 0:
+                print(
+                    f"Epoch {epoch + 1}/{args.epochs} | "
+                    f"Val MAE: {val_metrics['mae']:.2f} ({val_metrics['nmae']:.2f}%) | "
+                    f"Active MAE: {val_metrics['active_mae']:.2f} "
+                    f"({val_metrics['active_nmae']:.2f}%) | "
+                    f"R²: {val_metrics['r2']:.4f} | MBE: {val_metrics['mbe']:.2f}"
+                )
+
+            scheduler.step()
+            if patience_counter >= args.patience:
+                print(f"Early stopping at epoch {epoch + 1}. Best epoch: {best_epoch}.")
+                break
+
+        if best_model_state is None or best_val_metrics is None:
+            raise RuntimeError("No valid model checkpoint was obtained.")
+        model.load_state_dict(best_model_state)
+
+        # Save best weights/config plus the fitted preprocessor used for inverse transformation/inference.
+        save_model(model, args, args.path_dir, preprocessor)
+        with open(os.path.join(args.path_dir, "best_epoch_metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {"best_epoch": best_epoch, "epochs_trained": epoch + 1, **best_val_metrics},
+                f,
+                indent=2,
+                allow_nan=True,
+            )
+
+        print(f"\nBest epoch: {best_epoch}; best validation Active MAE: {best_val_mae:.4f}")
+        print(f"Saved best model and preprocessor to: {args.path_dir}")
+
+        # Detailed, post-training metrics use the restored best checkpoint, original units,
+        # original feature DataFrames, and the target timestamp for every predicted hour.
+        run_detailed_evaluation(
+            split_name="validation",
+            raw_features=dev_df,
+            data_with_context=val_data,
+            dataset=val_dataset,
+            dataloader=val_loader,
+            model=model,
+            preprocessor=preprocessor,
+            args=args,
+            device=device,
+        )
+        run_detailed_evaluation(
+            split_name="test",
+            raw_features=test_df,
+            data_with_context=test_data,
+            dataset=test_dataset,
+            dataloader=test_loader,
+            model=model,
+            preprocessor=preprocessor,
+            args=args,
+            device=device,
+        )
+
+        print(f"\nSaved model and detailed validation/test metrics to: {args.path_dir}")
+
+    finally:
+        writer.close()
+
+
 
 
 if __name__ == "__main__":

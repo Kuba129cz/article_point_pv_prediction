@@ -1,0 +1,32 @@
+{
+  "fold_idx": "lstm_future_ensemble_seed2026",
+  "lookback_cols": [
+    "Forecast_temperature",
+    "Forecast_humidity",
+    "Forecast cloud_cover",
+    "Forecast_GHI",
+    "Forecast_DHI",
+    "PV_energy",
+    "sin_hour",
+    "cos_hour",
+    "sin_day_of_year",
+    "cos_day_of_year",
+    "wind_u",
+    "wind_v"
+  ],
+  "horizon_cols": [
+    "Forecast_temperature",
+    "Forecast_humidity",
+    "Forecast cloud_cover",
+    "Forecast_GHI",
+    "Forecast_DHI",
+    "sin_hour",
+    "cos_hour",
+    "sin_day_of_year",
+    "cos_day_of_year",
+    "wind_u",
+    "wind_v"
+  ],
+  "target_col": "PV_energy",
+  "run_id": "lstm_future_ensemble_seed2026"
+}

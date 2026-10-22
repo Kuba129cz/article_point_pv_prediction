@@ -19,7 +19,7 @@ class Model(torch.nn.Module):
 
         self.dropout = torch.nn.Dropout(args.dropout)
 
-        self.linear = torch.nn.LazyLinear(args.output_size)
+        self.linear = torch.nn.LazyLinear(args.horizon)
 
     def forward(self, x_past, *args, **kwargs):
         output, _ = self.lstm(x_past)
